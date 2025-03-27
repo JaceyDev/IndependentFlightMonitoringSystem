@@ -2,16 +2,16 @@
 #include <SdFat.h>
 #include <string.h>
 #include <avr/wdt.h>
+#include <TinyGPS++.h> 
 
 /*
 Known Bugs:
-
 - Start("file.csv"), Delete("file.csv"), Start("file.csv"), Delete("file.csv"). After creating the second file with the same name, delete keeps failing
 */
 
 // LED Indicator
 // Constant Red Light: Error has occurred and waiting for watchdog to restart the device
-// Flashing Red Light: Logging is active
+// Flashing Red Light: GPS Signal is valid and has been logged. Infrequent flashing means the gps data is stale / lack of connection
 // One Flash After Command: Error processing command
 
 // Constants
@@ -22,7 +22,9 @@ const unsigned long LOG_INTERVAL_MS = 100;
 SdFat sd;
 File logFile;
 bool loggingActive = false;
-bool debugMode = true;
+bool debugMode = false;
+
+TinyGPSPlus gps;
 
 // Function Prototypes
 //     Commands
@@ -32,6 +34,7 @@ void ListCommand();
 void ReadCommand(const String &filename);
 void DeleteCommand(const String &filename);
 void DebugCommand();
+void GpsCommand();
 //     Serial
 void processSerialCommands();
 //     General
@@ -51,7 +54,7 @@ void StartCommand(const String &filename) {
     block();
   }
   if (!fileExists) {
-    logToFile("MS");
+    logToFile("Timestamp,Lat,Lon");
     logToSerial("Adding CSV headers to new log file");
   }
   logToSerial("Logging started.");
@@ -135,6 +138,16 @@ void DebugCommand() {
   }
 }
 
+void GpsCommand() {
+  if (gps.location.isValid()) { 
+    logToSerial("Latitude: " + String(gps.location.lat(), 6));
+    logToSerial("Longitude: " + String(gps.location.lng(), 6));
+    logToSerial("Age: " + String(gps.location.age()) + "ms");
+  } else {
+    logToSerial("No valid GPS fix.");
+  }
+}
+
 void processSerialCommands() {
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
@@ -181,6 +194,8 @@ void processSerialCommands() {
       }
     } else if (command == "debug") {
       DebugCommand();
+    } else if (command == "gps") {
+      GpsCommand();
     } else {
       logToSerial("Unknown command. Use 'START {FILENAME}', 'STOP', 'LIST', 'READ {FILENAME}', 'DELETE {FILENAME}', 'DEBUG'");
       digitalWrite(LED_BUILTIN, HIGH);
@@ -193,11 +208,28 @@ void recordData() {
   unsigned long currentMillis = millis();
 
   if (loggingActive && (currentMillis - lastLogTime >= LOG_INTERVAL_MS)) {
-    digitalWrite(LED_BUILTIN, HIGH);
     lastLogTime = currentMillis;
-    String csvLine = String(currentMillis);
-    logToFile(csvLine);
-    logToSerial("New Line: " + csvLine);
+    // GPS data will only get logged if the date, time and location is valid and the location data is not older than 150ms
+    // 150ms is an arbitary number, subject to change. Just dont want stale data being logged
+    if (gps.location.isValid() && gps.date.isValid() && gps.time.isValid() && gps.location.age() < 150) {  // Check if all required data is valid
+      digitalWrite(LED_BUILTIN, HIGH);
+      // Extract GPS date and time
+      int year = gps.date.year();
+      byte month = gps.date.month();
+      byte day = gps.date.day();
+      byte hour = gps.time.hour();
+      byte minute = gps.time.minute();
+      byte second = gps.time.second();
+      // YYYY-MM-DD HH:MM:SS
+      String timestamp = String(year) + "-" + padNumber(month) + "-" + padNumber(day) + " " +
+                         padNumber(hour) + ":" + padNumber(minute) + ":" + padNumber(second);
+      // Construct the CSV line with the timestamp
+      String csvLine = timestamp + "," + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+      logToFile(csvLine);
+      logToSerial("New Line: " + csvLine);
+    } else {
+      logToSerial("No new data");
+    }
   }
 }
 
@@ -221,6 +253,7 @@ void setup() {
   wdt_disable();
 
   Serial.begin(9600);
+  Serial1.begin(9600);
   while (!Serial) {
     // Wait for serial port to connect. Temporary.
   }
@@ -242,11 +275,22 @@ void setup() {
 
   logToSerial("Send 'START {FILENAME}' to begin logging, 'STOP' to end logging,");
   logToSerial("'LIST' to list files, 'READ {FILENAME}' to read a file.");
+
+  StartCommand(String(random(1000))+".csv");
 }
 
 void loop() {
   digitalWrite(LED_BUILTIN, LOW);
   processSerialCommands();
   recordData();
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    gps.encode(c); 
+    //logToSerial(c);
+  }
   wdt_reset();
+}
+
+String padNumber(int num) {
+  return num < 10 ? "0" + String(num) : String(num);
 }
